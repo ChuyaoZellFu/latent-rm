@@ -30,23 +30,29 @@ from model import LatentRewModel
 
 
 @torch.no_grad()
-def evaluate_latents(model, latent, device, threshold=0.5, tail_ratio=0.25, debug=False, debug_label=""):
+def evaluate_latents(model, latent, device, threshold=0.5, tail_ratio=0.25,
+                     judgment="max", debug=False, debug_label=""):
     """
     对单条 latent 序列进行推理，返回序列级别的成功判断。
 
-    判断逻辑：取所有帧中最大的成功概率（max_prob > threshold）。
-    模型训练时以成功轨迹末尾帧为正样本，末尾帧才有高概率，
-    但只要轨迹中包含一个成功状态帧，max_prob 即可正确判断。
-    失败轨迹所有帧均被训练为负样本，max_prob 始终极低（<0.05）。
+    judgment 参数控制判断依据：
+        "max"  (默认): max_prob — 全帧最大成功概率 > threshold。
+                适用于短预测窗口数据（如 latent_eval，T≈56 帧），
+                成功状态可能出现在窗口任意位置。
+        "tail": tail_mean — 末尾 tail_ratio 比例帧的平均成功概率 > threshold。
+                适用于完整 episode 数据（如 task_eval，成功 T≈42 帧终止，
+                失败 T=195 帧跑完全程），避免长失败序列因某中间帧偶然得高分
+                而被误判。
 
     参数:
-        latent: [T, P, D]
-        tail_ratio: 仅用于 debug 输出中展示 tail_mean，不影响判断
+        latent: [T, P, D]  — 形状已经过 reshape 归一化
+        tail_ratio: 末尾帧比例（judgment="tail" 时作为判断依据）
+        judgment: "max" 或 "tail"
         debug: 打印逐帧概率分布
 
     返回:
         is_success: bool
-        max_prob: float, 所有帧中最大成功概率（判断依据）
+        score: float, 判断依据的分数（max_prob 或 tail_mean）
         all_probs: np.ndarray [T], 所有帧的成功概率（供分析用）
     """
     model.eval()
@@ -54,29 +60,55 @@ def evaluate_latents(model, latent, device, threshold=0.5, tail_ratio=0.25, debu
     all_probs = model.forward_train(latent).squeeze(-1).cpu().numpy()  # [T]
 
     T = len(all_probs)
+    tail_start = max(0, T - max(1, int(T * tail_ratio)))
+    tail_mean = float(all_probs[tail_start:].mean())
     max_prob = float(all_probs.max())
-    is_success = max_prob > threshold
+
+    if judgment == "tail":
+        score = tail_mean
+    else:
+        score = max_prob
+    is_success = score > threshold
 
     if debug:
-        tail_start = max(0, T - max(1, int(T * tail_ratio)))
-        tail_mean = float(all_probs[tail_start:].mean())
         n_show = min(10, T)
         print(f"\n    [{debug_label}] T={T}, mean={all_probs.mean():.4f}, "
               f"max={max_prob:.4f} @frame{all_probs.argmax()}, "
-              f"tail({tail_ratio:.0%}) mean={tail_mean:.4f}")
+              f"tail({tail_ratio:.0%}) mean={tail_mean:.4f}  "
+              f"[judgment={judgment}] -> {'SUCCESS' if is_success else 'FAILURE'}")
         print(f"      First {n_show} frames: " +
               " ".join(f"{p:.3f}" for p in all_probs[:n_show]))
         print(f"      Last  {n_show} frames: " +
               " ".join(f"{p:.3f}" for p in all_probs[-n_show:]))
 
-    return is_success, max_prob, all_probs
+    return is_success, score, all_probs
 
 
 def find_latent_batches(latent_dir):
-    """扫描 latent_dir 下所有 batch 目录。"""
-    pattern = os.path.join(latent_dir, "batch_*")
-    batches = sorted(glob.glob(pattern))
-    return batches
+    """扫描 latent_dir 下所有 batch 或 episode 目录。
+
+    支持两种结构:
+      1. batch_* 结构: latent_dir/batch_000/gt_latents.pth
+      2. episode_* 结构: latent_dir/episode_0000/gt_latents.pth
+      3. task/episode 结构: latent_dir/<task_name>/episode_XXXX/gt_latents.pth
+    """
+    batch_dirs = sorted(glob.glob(os.path.join(latent_dir, "batch_*")))
+    if batch_dirs:
+        return batch_dirs
+
+    episode_dirs = sorted(glob.glob(os.path.join(latent_dir, "episode_*")))
+    if episode_dirs:
+        return episode_dirs
+
+    task_dirs = sorted([
+        d for d in glob.glob(os.path.join(latent_dir, "*"))
+        if os.path.isdir(d) and not os.path.basename(d).startswith(".")
+    ])
+    episode_dirs = []
+    for task_dir in task_dirs:
+        eps = sorted(glob.glob(os.path.join(task_dir, "episode_*")))
+        episode_dirs.extend(eps)
+    return episode_dirs
 
 
 def load_latent_file(path, num_patches=256, emb_dim=2048):
@@ -114,19 +146,28 @@ def load_latent_file(path, num_patches=256, emb_dim=2048):
 
 def load_metadata(latent_dir):
     """
-    加载 sample_metadata.csv（如果存在），返回 {batch_idx: label} 字典。
-    label 为 'success' 或 'failure'。
+    加载 sample_metadata.csv 或 per_episode_metrics.csv（如果存在），
+    返回 {batch_idx: label} 字典。label 为 'success' 或 'failure'。
+
+    对于 per_episode_metrics.csv，没有直接的 success/failure 标签，跳过元数据。
     """
     csv_path = os.path.join(latent_dir, "sample_metadata.csv")
-    if not os.path.exists(csv_path):
-        return None
-    meta = {}
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            batch_idx = int(row["batch_idx"])
-            meta[batch_idx] = row["label"]
-    return meta
+    if os.path.exists(csv_path):
+        meta = {}
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                batch_idx = int(row["batch_idx"])
+                meta[batch_idx] = row["label"]
+        return meta
+
+    # 向上一级查找 per_episode_metrics.csv（task_eval_pcp 结构）
+    parent_csv = os.path.join(os.path.dirname(latent_dir), "per_episode_metrics.csv")
+    if not os.path.exists(parent_csv):
+        parent_csv = os.path.join(latent_dir, "per_episode_metrics.csv")
+    if os.path.exists(parent_csv):
+        print(f"Found per_episode_metrics.csv at {parent_csv} (no success labels, skipping metadata)")
+    return None
 
 
 def compute_metrics(pred_arr, gt_arr):
@@ -165,6 +206,9 @@ def main():
                         help="Probability threshold for success (default: 0.5)")
     parser.add_argument("--tail_ratio", type=float, default=0.25,
                         help="Fraction of trailing frames to average for sequence-level score (default: 0.25)")
+    parser.add_argument("--judgment", type=str, default="max", choices=["max", "tail"],
+                        help="Judgment method: 'max' (max_prob, default) or 'tail' (tail_mean). "
+                             "Use 'tail' for full-episode task_eval data to avoid long-failure false positives.")
     parser.add_argument("--debug_batch", type=str, default=None,
                         help="Print per-frame prob distribution for this batch name, e.g. 'batch_000' (or 'all')")
     args = parser.parse_args()
@@ -175,7 +219,8 @@ def main():
     print(f"Loading model from {args.checkpoint}")
     model = LatentRewModel(checkpoint_path=args.checkpoint)
     model = model.to(device)
-    print(f"Judgment logic: max_prob over all frames > {args.threshold}\n")
+    score_label = "tail_mean (last {:.0%} frames)".format(args.tail_ratio) if args.judgment == "tail" else "max_prob"
+    print(f"Judgment: {args.judgment}  |  Score: {score_label}  |  Threshold: {args.threshold}\n")
 
     # 加载元数据（如有）
     meta = load_metadata(args.latent_dir)
@@ -199,7 +244,7 @@ def main():
 
     hdr_label = f"{'Label':<10}" if has_meta else ""
     print("=" * 90)
-    print(f"  {'Batch':<12} {hdr_label} {'GT_Succ':>8} {'GT_MaxP':>8} {'Pred_Succ':>10} {'Pred_MaxP':>10}")
+    print(f"  {'Batch':<12} {hdr_label} {'GT_Succ':>8} {'GT_Tail':>8} {'Pred_Succ':>10} {'Pred_Tail':>10}")
     print("-" * 90)
 
     for batch_dir in batches:
@@ -219,15 +264,15 @@ def main():
         do_debug = (args.debug_batch == "all" or args.debug_batch == batch_name)
 
         # 评估 GT
-        gt_is_success, gt_max_prob, gt_all_probs = evaluate_latents(
+        gt_is_success, gt_score, gt_all_probs = evaluate_latents(
             model, gt_latent, device, threshold=args.threshold, tail_ratio=args.tail_ratio,
-            debug=do_debug, debug_label=f"{batch_name} GT"
+            judgment=args.judgment, debug=do_debug, debug_label=f"{batch_name} GT"
         )
 
         # 评估 Pred
-        pred_is_success, pred_max_prob, pred_all_probs = evaluate_latents(
+        pred_is_success, pred_score, pred_all_probs = evaluate_latents(
             model, pred_latent, device, threshold=args.threshold, tail_ratio=args.tail_ratio,
-            debug=do_debug, debug_label=f"{batch_name} Pred"
+            judgment=args.judgment, debug=do_debug, debug_label=f"{batch_name} Pred"
         )
 
         gt_status = "YES" if gt_is_success else "NO"
@@ -236,15 +281,15 @@ def main():
         true_label = meta.get(batch_idx, "?") if has_meta else None
         label_str = f"{true_label:<10}" if has_meta else ""
 
-        print(f"  {batch_name:<12} {label_str} {gt_status:>8} {gt_max_prob:>8.4f} {pred_status:>10} {pred_max_prob:>10.4f}")
+        print(f"  {batch_name:<12} {label_str} {gt_status:>8} {gt_score:>8.4f} {pred_status:>10} {pred_score:>10.4f}")
 
         record = {
             "batch": batch_name,
             "gt_is_success": gt_is_success,
-            "gt_max_prob": gt_max_prob,
+            "gt_score": gt_score,
             "gt_mean_prob": float(gt_all_probs.mean()),
             "pred_is_success": pred_is_success,
-            "pred_max_prob": pred_max_prob,
+            "pred_score": pred_score,
             "pred_mean_prob": float(pred_all_probs.mean()),
         }
         if has_meta:
